@@ -1,0 +1,5 @@
+node_modules/
+dist/
+src/vendor/
+userscript.meta.js
+package-lock.json
