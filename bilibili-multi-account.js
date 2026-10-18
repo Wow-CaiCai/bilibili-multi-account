@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili Multi-Account
 // @namespace    piliplus.local.multi-account
-// @version      1.5.10
+// @version      1.5.25
 // @description  支持密码、短信、二维码登录，按主账号、记录观看、推荐和视频取流分别选择 B 站账号。
 // @match        https://*.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -81,11 +81,11 @@
   const REPORTS = new Set(['/x/click-interface/web/heartbeat', '/x/click-interface/click/web/h5',
     '/x/v2/history/report', '/x/v1/medialist/history', '/xlive/web-room/v1/index/roomEntryAction',
     '/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3']);
-  const defaults = () => ({ version: 1, enabled: false, accounts: [],
+  const defaults = () => ({ version: 1, enabled: true, accounts: [],
     roles: { main: 'browser', heartbeat: 'browser', recommend: 'browser', video: 'browser' } });
   let state = load();
-  let host, shadow, dialog, statusBox, browserStatusBox, refreshAccountChoices;
-  let noticeTimer = null;
+  let host, shadow, dialog, statusBox, refreshAccountChoices;
+  const noticeTimers = new Map();
   let accountMenu = null;
   let loginMethod = 'qrcode';
   let disposeLogin = null;
@@ -97,7 +97,6 @@
   let profileRefreshPromise;
   const profileAttempts = new Map();
   let panelDraft = null;
-  let panelEnabled = null;
   let panelAddingAccount = false;
   const pendingPlayerRefresh = new WeakMap();
   const nativeFetch = page.fetch;
@@ -179,7 +178,7 @@
   function validateState(value) {
     if (!value || value.version !== 1 || !Array.isArray(value.accounts)) throw new Error('备份格式不支持');
     const next = defaults();
-    next.enabled = value.enabled === true;
+    // Ignore legacy disabled flags so stored and imported accounts stay active.
     next.accounts = value.accounts.map(a => {
       const cookies = cookiesFrom(a.cookies);
       const mid = cookies.DedeUserID;
@@ -245,6 +244,7 @@
         if (current && current.cookies.SESSDATA === account.cookies.SESSDATA) saveProfile(account.mid, data);
         profileAttempts.set(account.mid, 'done');
       } catch (_) { profileAttempts.set(account.mid, 'failed'); }
+      finally { refreshAccountChoices?.(); }
     })).then(() => {
       if (work.length) save();
       refreshAccountChoices?.();
@@ -254,9 +254,6 @@
   function updateBrowserInfo() {
     refreshAccountChoices?.();
     for (const node of browserLabels) node.textContent = browserLabel();
-    if (browserStatusBox) browserStatusBox.textContent = browserIdentity.status === 'loggedIn'
-      ? browserLabel() : browserIdentity.status === 'loggedOut' ? '未登录'
-        : browserIdentity.status === 'loading' ? '读取中…' : '浏览器账号';
   }
   function detectBrowserAccount() {
     if (browserReadPromise) return browserReadPromise;
@@ -1024,7 +1021,7 @@
   }
   function renderLoginForm(content, draft) {
     const context = loginContext();
-    const form = el('form', null, { class: 'card form login-form', autocomplete: 'off' });
+    const form = el('form', null, { class: `card form login-form${loginMethod === 'qrcode' ? ' qrcode-form' : ''}`, autocomplete: 'off' });
     const methods = el('div', null, { class: 'login-tabs', role: 'tablist', 'aria-label': '添加账号方式' });
     const methodKeys = ['qrcode', 'password', 'sms'];
     for (const [method, label] of [['qrcode', '二维码'], ['password', '密码'], ['sms', '验证码']]) {
@@ -1085,9 +1082,9 @@
       fields.append(control); return control;
     };
     form.addEventListener('submit', event => { event.preventDefault(); if (submitAction) void run(submitAction); });
-    let disposeQR = null;
+    let disposeQR = null, disposeQRLayout = null;
     disposeLogin = () => {
-      context.dispose(); disposeQR?.();
+      context.dispose(); disposeQR?.(); disposeQRLayout?.();
       for (const input of form.querySelectorAll('input,textarea')) input.value = '';
     };
 
@@ -1172,6 +1169,30 @@
       const canvas = el('canvas', null, { class: 'qr-canvas', role: 'img', 'aria-label': '哔哩哔哩登录二维码', hidden: '' });
       box.append(placeholder, canvas); fields.append(box);
       const refresh = el('button', '刷新二维码', { type: 'button', class: 'text-button qr-refresh' }); fields.append(refresh);
+      // Use the smaller of the available width and height after login controls.
+      let layoutFrame = null;
+      const fitQRCode = () => {
+        layoutFrame = null;
+        if (context.signal.aborted || !form.isConnected || !dialog.open) return;
+        const pool = form.closest('.pool-pane');
+        const workspace = pool.closest('.workspace');
+        const formRect = form.getBoundingClientRect();
+        const poolRect = pool.getBoundingClientRect();
+        const style = page.getComputedStyle(form);
+        const width = form.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        const availableHeight = (page.matchMedia('(min-width:761px)').matches ? pool.clientHeight : workspace.clientHeight)
+          - (formRect.top - poolRect.top + pool.scrollTop);
+        const controlsHeight = formRect.height - box.getBoundingClientRect().height;
+        const size = Math.max(80, Math.floor(Math.min(width, availableHeight - controlsHeight - 1)));
+        if (form.style.getPropertyValue('--login-qr-size') !== size + 'px') form.style.setProperty('--login-qr-size', size + 'px');
+      };
+      const queueLayout = () => {
+        if (layoutFrame === null) layoutFrame = page.requestAnimationFrame(fitQRCode);
+      };
+      const layoutObserver = new page.ResizeObserver(queueLayout);
+      for (const node of [form, methods, status, refresh, content.closest('.pool-pane')]) layoutObserver.observe(node);
+      disposeQRLayout = () => { layoutObserver.disconnect(); if (layoutFrame !== null) page.cancelAnimationFrame(layoutFrame); };
+      queueLayout();
       const start = async () => {
         disposeQR?.();
         const session = loginContext();
@@ -1182,7 +1203,7 @@
         const data = await loginRequest(session, '/x/passport-login/web/qrcode/generate', null, { source: 'main_web' });
         const qr = loginQRData(data);
         drawLoginQR(canvas, qr.value); canvas.hidden = false; placeholder.hidden = true;
-        setStatus('使用哔哩哔哩客户端扫码');
+        setStatus('');
         const expires = Date.now() + 180000;
         const expired = () => { canvas.classList.add('expired'); setStatus('二维码已失效，点击刷新'); };
         const poll = async () => {
@@ -1193,7 +1214,7 @@
             if (Number(result.code) === 0) { await complete(result, session); return; }
             if (Number(result.code) === 86038) { expired(); return; }
             if (Number(result.code) === 86090) setStatus('已扫码，请在手机上确认');
-            else if (Number(result.code) === 86101) setStatus('使用哔哩哔哩客户端扫码');
+            else if (Number(result.code) === 86101) setStatus('');
             else throw loginError(result.code);
             session.delay(() => void poll(), 3000);
           } catch (error) {
@@ -1234,26 +1255,27 @@
     for (const [mid, name] of names) text = text.split(mid).join(name);
     return text.replace(/UID\s*\d+/g, '其他账号').replace(/UID\s*/g, '');
   }
-  function clearNotice() {
-    clearTimeout(noticeTimer); noticeTimer = null;
-    if (!statusBox) return;
-    statusBox.hidden = true; statusBox.textContent = ''; statusBox.classList.remove('fading');
+  function clearNotice(box) {
+    const boxes = box ? [box] : [...new Set([statusBox, ...noticeTimers.keys()])];
+    for (const item of boxes) {
+      if (!item) continue;
+      clearTimeout(noticeTimers.get(item)); noticeTimers.delete(item);
+      item.hidden = true; item.textContent = ''; item.classList.remove('fading');
+    }
   }
-  function notice(message) {
-    clearNotice();
-    if (!statusBox || !message) return;
-    const box = statusBox;
+  function notice(message, box = statusBox) {
+    if (!box || !message) return;
+    clearNotice(box);
     box.textContent = friendlyText(message); box.hidden = false;
-    // Keep the message legible, then fade it out within three seconds. A new
-    // result replaces the previous message and restarts the lifetime.
-    noticeTimer = setTimeout(() => {
+    noticeTimers.set(box, setTimeout(() => {
       box.classList.add('fading');
-      noticeTimer = setTimeout(() => {
-        box.hidden = true; box.textContent = ''; box.classList.remove('fading'); noticeTimer = null;
-      }, 600);
-    }, 2400);
+      noticeTimers.set(box, setTimeout(() => clearNotice(box), 600));
+    }, 2400));
   }
   function icon(name, className = '') {
+    // Original favicon served by bilibili.com; embedded to avoid extra requests.
+    if (name === 'bilibili') return el('img', null, { class: `icon ${className}`,
+      src: 'data:image/x-icon;base64,AAABAAEAICAAAAEAIACoEAAAFgAAACgAAAAgAAAAQAAAAAEAIAAAAAAAABAAABMLAAATCwAAAAAAAAAAAAD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A1qEAANahAADWoQAG1qEAb9ahAMvWoQD01qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD01qEAy9ahAG/WoQAG1qEAANahAADWoQAA1qEAG9ahAM/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahANDWoQAb1qEAANahAAfWoQDQ1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahANHWoQAH1qEAbtahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAG7WoQDH1qEA/9ahAP/WoQD/1qEAtdahABjWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahABvWoQC11qEA/9ahAP/WoQD/1qEAx9ahAPnWoQD/1qEA/9ahAP/WoQAZ1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahABjWoQD/1qEA/9ahAP/WoQDz1qEA/9ahAP/WoQD/1qEA/9ahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAErWoQDn1qEA5NahAErWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAErWoQDn1qEA5NahAErWoQAA1qEAANahAADWoQAA1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEA5tahAP/WoQD/1qEA59ahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEA5tahAP/WoQD/1qEA59ahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEA5tahAP/WoQD/1qEA5tahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEA5tahAP/WoQD/1qEA5tahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAADWoQAA1qEAANahAADWoQBJ1qEA5tahAObWoQBJ1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQBJ1qEA5tahAObWoQBJ1qEAANahAADWoQAA1qEAANahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQD/1qEA/9ahAP/WoQD/1qEA+dahAP/WoQD/1qEA/9ahABnWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAGdahAP/WoQD/1qEA/9ahAPjWoQDH1qEA/9ahAP/WoQD/1qEAttahABnWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahABnWoQC21qEA/9ahAP/WoQD/1qEAx9ahAG3WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQBt1qEABtahAM/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA0NahAAfWoQAA1qEAG9ahAM/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAM/WoQAb1qEAANahAADWoQAA1qEABtahAG7WoQDH1qEA89ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA/9ahAP/WoQD/1qEA89ahAMfWoQBu1qEABtahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEADtahAMXWoQD/1qEA/9ahAP/WoQD/1qEAxdahAA/WoQAA1qEAANahAADWoQAA1qEADtahAMXWoQD/1qEA/9ahAP/WoQD/1qEAxdahAA/WoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAAbWoQDF1qEA/9ahAP/WoQD/1qEA/9ahAMXWoQAP1qEAANahAADWoQAA1qEAANahAADWoQAA1qEADtahAMXWoQD/1qEA/9ahAP/WoQD/1qEAxdahAAbWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAYtahAP/WoQD/1qEA/9ahAP/WoQDF1qEADtahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEADtahAMXWoQD/1qEA/9ahAP/WoQD/1qEAY9ahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQBf1qEA/9ahAP/WoQD/1qEAxdahAA7WoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEADtahAMXWoQD/1qEA/9ahAP/WoQBf1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAATWoQCg1qEA6tahAKjWoQAO1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEAANahAADWoQAA1qEADtahAKjWoQDr1qEAoNahAATWoQAA1qEAANahAADWoQAA1qEAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A///////////AAAADgAAAAQAAAAAAAAAAA///wAf//+AP///wD///8A////AP///wDw/w8A8P8PAPD/DwDw/w8A8P8PAPD/DwD///8A////AH///gA///wAAAAAAAAAAAgAAAAcAAAAP8A8A/+AfgH/gP8B/4H/gf+D/8H/////8=', alt: '', 'aria-hidden': 'true' });
     const paths = {
       person: ['M20 21v-2a7 7 0 0 0-14 0v2', 'M17 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0'],
       history: ['M3 11a9 9 0 1 1 2.7 7', 'M3 4v7h7', 'M12 7v5l3 2'],
@@ -1343,9 +1365,10 @@
       .icon{width:20px;height:20px;flex:none;display:block}button{border:0;color:var(--text);background:transparent}
       .launcher{position:fixed;right:max(20px,env(safe-area-inset-right));bottom:max(20px,env(safe-area-inset-bottom));z-index:2147483646;display:grid;place-items:center;width:44px;height:44px;padding:0;border:1px solid #ffffffb3;border-radius:50%;background:#ffffffdf;color:#26262a;backdrop-filter:blur(24px);box-shadow:0 4px 24px #00000012}
       .launcher .icon{width:20px;height:20px;color:#007aff}
-      dialog{--text:#1d1d1f;--secondary:#6e6e76;--card:#ffffff;--line:#0000000b;--field:#f5f5f7;--accent:#007aff;--hover:#00000004;border:1px solid #ffffffc9;border-radius:28px;padding:0;width:min(960px,calc(100vw - 32px));height:min(760px,calc(100dvh - 32px));max-height:calc(100dvh - 32px);overflow:hidden;background:#f5f5f7f5;color:var(--text);box-shadow:0 30px 100px #00000025,0 2px 10px #0000000a;backdrop-filter:blur(40px);-webkit-backdrop-filter:blur(40px)}
+      dialog{--text:#1d1d1f;--secondary:#6e6e76;--card:#ffffff;--line:#0000000b;--field:#f5f5f7;--accent:#007aff;--hover:#00000004;border:1px solid #ffffffc9;border-radius:28px;padding:0;width:min(960px,calc(100vw - 32px));height:min(560px,calc(100dvh - 32px));max-height:calc(100dvh - 32px);overflow:hidden;background:#f5f5f7f5;color:var(--text);box-shadow:0 30px 100px #00000025,0 2px 10px #0000000a;backdrop-filter:blur(40px);-webkit-backdrop-filter:blur(40px)}
       dialog::backdrop{background:#11182738;backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px)}
       .sheet{display:flex;flex-direction:column;height:100%;min-height:0}.header{flex:none;display:flex;align-items:center;justify-content:space-between;padding:27px 28px 21px;gap:12px}
+      .panel-title{display:flex;align-items:center;gap:10px;min-width:0}.panel-title .icon{width:30px;height:30px;color:#fb7299}.close{flex:none}
       h2{font-size:25px;line-height:1.2;letter-spacing:-.7px;font-weight:650;margin:0}h3{font-size:12px;font-weight:500;color:var(--secondary);margin:22px 0 9px 13px}
       .close{width:29px;height:29px;border-radius:50%;display:grid;place-items:center;background:#e7e7ec;color:#75757b;padding:0}.close .icon{width:15px;height:15px;stroke-width:2.2}
       .tab{padding:7px 6px;border-radius:8px;color:#66666d;font-size:13px;font-weight:500;transition:background .16s,box-shadow .16s}.tab[aria-selected=true]{color:var(--text);background:var(--card);box-shadow:0 2px 5px #0000000d,0 0 0 1px #00000003}
@@ -1355,35 +1378,37 @@
       .pool-actions{display:flex;align-items:center;gap:4px;margin-left:auto}.pool-actions .add-account,.pool-transfer{display:flex;align-items:center;justify-content:center;gap:4px;min-height:44px;padding:8px 6px;border-radius:10px;color:var(--accent);background:var(--card);font-size:12px;white-space:nowrap}.pool-transfer .icon{width:15px;height:15px}.pool-transfer:hover,.pool-transfer[aria-expanded=true]{background:var(--field)}
       .transfer-option{display:flex;align-items:center;gap:10px;width:100%;min-height:44px;padding:10px 12px;border-radius:10px;font-size:13px;text-align:left}.transfer-option:hover,.transfer-option:focus-visible{background:var(--field)}.transfer-option .icon{width:17px;height:17px;color:var(--accent)}
       .add-account{display:flex;align-items:center;justify-content:center;gap:5px;min-height:44px;padding:8px 10px;border-radius:10px;color:var(--accent);background:var(--card);font-size:13px;white-space:nowrap}.add-account .icon{width:15px;height:15px}.add-account:hover{background:var(--field)}
-      .content{flex:1;min-height:0;display:grid;grid-template-rows:minmax(0,1fr) auto 72px;gap:10px}.assignment-details{min-height:0;display:grid;grid-template-rows:64px 18px minmax(176px,1fr);gap:10px;overflow:auto;scrollbar-width:thin;overscroll-behavior:contain}.assignment-details>h3{margin:0 0 0 13px;align-self:center}.assignments{display:grid;grid-template-rows:repeat(4,minmax(44px,1fr))}.assignments .setting-row{min-height:0;padding:4px 15px}.pool-pane>.card{margin-bottom:16px}.pool-pane .account-row{gap:10px;padding:15px 12px}.pool-pane .account-row .danger{padding:8px 4px;font-size:12px}.pool-pane .account-name{font-size:14px}.pool-pane .badges{flex-wrap:wrap;gap:4px}.pool-pane .badge.usage{color:var(--accent);background:var(--field)}
-      .pool-note{font-size:12px;line-height:1.6;color:var(--secondary);margin:12px 2px 0}.pool-pane .form{padding:12px}.pool-pane .login-tabs .tab{padding:7px 3px;font-size:12px}.pool-pane .qr-box{width:216px;height:216px}.pool-pane .qr-canvas{width:200px;height:200px}.pool-pane .form-actions{gap:4px}.pool-pane .form-actions .action{padding:8px 10px}.assignment-pane .session{margin:0;padding:11px 16px}
+      .content{flex:1;min-height:0;display:grid;grid-template-rows:minmax(0,1fr);gap:10px}.assignment-details{min-height:0;display:grid;grid-template-rows:minmax(288px,1fr);gap:10px;overflow:auto;scrollbar-width:thin;overscroll-behavior:contain}.assignments{display:grid;grid-template-rows:repeat(4,minmax(72px,1fr))}.assignments .setting-row{min-height:0;padding:4px 15px}.pool-pane>.card{margin-bottom:16px}.pool-pane .account-row{gap:10px;padding:15px 12px}.pool-pane .account-row .danger{padding:8px 4px;font-size:12px}.pool-pane .account-name{font-size:14px}.pool-pane .badges{flex-wrap:wrap;gap:4px}
+      .pool-note{font-size:12px;line-height:1.6;color:var(--secondary);margin:12px 2px 0}.pool-pane .form{padding:12px}.pool-pane .login-tabs .tab{padding:7px 3px;font-size:12px}.pool-pane .qr-box{width:var(--login-qr-size,192px);height:var(--login-qr-size,192px);margin:0 auto}.pool-pane .qr-canvas{width:100%;height:100%}.pool-pane .qrcode-form{gap:8px;margin:0}.pool-pane .qrcode-form .login-tabs{margin-bottom:0}.pool-pane .qrcode-form .login-fields{gap:6px}.pool-pane .qrcode-form .qr-refresh{margin-top:0;padding:5px 10px;min-height:30px}.pool-pane .form-actions{gap:4px}.pool-pane .form-actions .action{padding:8px 10px}
       .card{background:var(--card);border-radius:17px;overflow:hidden;box-shadow:0 0 0 1px #00000002}
-      .session{display:flex;gap:12px;align-items:center;padding:15px 16px}.session-copy{flex:1;min-width:0}.eyebrow{font-size:11px;color:var(--secondary);margin-bottom:3px}.session-name{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .avatar{width:42px;height:42px;flex:none;overflow:hidden;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#dceaff,#dfe1f6);color:#627596}.avatar img{width:100%;height:100%;object-fit:cover}.avatar.small{width:36px;height:36px}.avatar .icon{width:21px;height:21px}
-      .switch{position:relative;width:43px;height:26px;border-radius:20px;background:#d1d1d6;padding:0;transition:background .2s}.switch[aria-checked=true]{background:#34c759}.switch::after{content:"";position:absolute;width:22px;height:22px;left:2px;top:2px;border-radius:50%;background:white;box-shadow:0 1px 3px #0003;transition:transform .2s}.switch[aria-checked=true]::after{transform:translateX(17px)}
       .setting-row{display:flex;align-items:center;gap:11px;min-height:61px;padding:12px 15px;position:relative}.setting-row+.setting-row::before{content:"";position:absolute;top:0;left:58px;right:0;height:1px;background:var(--line)}.setting-label{font-size:14px;font-weight:500;white-space:nowrap}.setting-icon{display:grid;place-items:center;width:31px;height:31px;border-radius:9px;flex:none}.setting-icon .icon{width:18px;height:18px}
+      .setting-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.setting-description{font-size:12px;line-height:1.5;color:var(--secondary);overflow-wrap:anywhere}.assignments .account-picker{flex:0 1 40%;max-width:40%}
       .blue{color:#007aff;background:#eaf3ff}.green{color:#2baf50;background:#eaf8ee}.purple{color:#9258d8;background:#f1eafd}.orange{color:#ed9636;background:#fff3e4}
       .account-picker{margin-left:auto;max-width:64%;min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:8px;border-radius:9px;padding:7px 0 7px 8px;font-size:14px;font-weight:500}.picker-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.account-picker>.icon{width:15px;height:15px;color:#b2b2b7;transition:transform .16s}.account-picker[aria-expanded=true]>.icon{transform:rotate(180deg)}.account-picker:hover,.account-picker[aria-expanded=true]{color:var(--accent)}
+      .account-picker .avatar{width:24px;height:24px}.account-picker .avatar .icon{width:15px;height:15px}
       .account-menu{position:absolute;z-index:10;width:244px;padding:6px;border-radius:17px;border:1px solid var(--line);background:var(--card);box-shadow:0 12px 36px #00000020,0 2px 6px #00000008;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;animation:menu-appear .14s ease-out;transform-origin:top right}.account-option{display:flex;align-items:center;gap:10px;width:100%;min-height:47px;padding:7px 10px;border-radius:11px;text-align:left;font-size:13px}.account-option:hover,.account-option:focus-visible{background:var(--field);outline:none}.account-option[aria-checked=true]{background:#007aff0d}.account-option .avatar{width:29px;height:29px}.account-option .avatar .icon{width:16px;height:16px}.account-option>.picker-name{flex:1}.account-option>.icon{width:17px;height:17px;color:var(--accent)}.account-option[aria-checked=false]>.icon{visibility:hidden}
       @keyframes menu-appear{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}
-      .notice-slot{position:relative;height:72px;min-height:72px;pointer-events:none}
-      .notice{position:absolute;z-index:20;left:50%;top:8px;transform:translateX(-50%);width:max-content;max-width:calc(100% - 32px);margin:0;padding:10px 16px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--text);box-shadow:0 8px 32px #00000020;font-size:13px;line-height:1.6;text-align:center;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none;opacity:1;transition:opacity .6s ease}.notice.fading{opacity:0}.notice[hidden]{display:none}
-      .footer{flex:none;padding:21px 28px 25px;display:flex;justify-content:flex-end;align-items:center;gap:9px}.action{padding:9px 18px;border-radius:10px;font-size:13px;font-weight:500;min-height:36px;background:var(--card);box-shadow:0 0 0 1px #00000006,0 1px 2px #00000005}.action:hover{filter:brightness(.98)}.primary{background:#007aff;color:#fff;box-shadow:0 2px 5px #007aff20;min-width:106px}.text-button{color:var(--accent);padding:7px 10px;font-size:13px}.danger{color:#ff453a}
-      .account-row{display:flex;gap:11px;align-items:center;padding:13px 14px}.account-row+.account-row{border-top:1px solid var(--line)}.account-copy{flex:1;min-width:0}.account-name{display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badges{display:flex;gap:6px;margin-top:4px}.badge{font-size:10px;line-height:1.5;padding:1px 5px;border-radius:4px;background:var(--field);color:var(--secondary)}.badge.vip{background:#fff0f4;color:#c66b85}
+      .notice-slot{position:absolute;bottom:76px;left:28px;right:28px;pointer-events:none}
+      .notice{position:absolute;z-index:20;left:50%;bottom:0;transform:translateX(-50%);width:max-content;max-width:calc(100% - 32px);margin:0;padding:10px 16px;border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--text);box-shadow:0 8px 32px #00000020;font-size:13px;line-height:1.6;text-align:center;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:none;opacity:1;transition:opacity .6s ease}.notice.fading{opacity:0}.notice[hidden]{display:none}
+      .footer{flex:none;padding:18px 28px 20px;display:flex;justify-content:flex-end;align-items:center;gap:9px}.action{padding:9px 18px;border-radius:10px;font-size:13px;font-weight:500;min-height:36px;background:var(--card);box-shadow:0 0 0 1px #00000006,0 1px 2px #00000005}.action:hover{filter:brightness(.98)}.primary{background:#007aff;color:#fff;box-shadow:0 2px 5px #007aff20;min-width:106px}.text-button{color:var(--accent);padding:7px 10px;font-size:13px}.danger{color:#ff453a}
+      .account-row{display:flex;gap:11px;align-items:center;padding:13px 14px}.account-row+.account-row{border-top:1px solid var(--line)}.account-copy{flex:1;min-width:0}.account-name{display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badges{display:flex;gap:6px;margin-top:4px}.badge{font-size:10px;line-height:1.5;padding:1px 5px;border-radius:4px;background:var(--field);color:var(--secondary)}.badge.vip{background:#fff0f4;color:#c66b85}.badge.login-valid{color:var(--accent);background:var(--field)}.badge.login-invalid{color:var(--secondary);background:var(--field)}
       .form{padding:14px;display:grid;gap:10px}input[type=text],input[type=password],input[type=tel],textarea{width:100%;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--field);padding:10px 12px;color:var(--text);font-size:13px}textarea{resize:vertical;min-height:102px;max-height:240px}.form-actions{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.form-actions .action{padding:8px 13px}.empty{padding:18px;text-align:center;color:var(--secondary);font-size:13px}
       .login-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:3px;border-radius:11px;background:var(--field);margin-bottom:5px}.login-fields{display:grid;gap:11px;min-width:0}.login-submit{width:100%;margin-top:2px}.form-actions .login-submit{width:auto;margin-top:0}.phone-row,.code-row{display:flex;align-items:center;gap:9px;min-width:0}.phone-row .country-code{width:67px;flex:none;text-align:center;padding:10px 6px}.code-row input{flex:1}.sms-send{flex:none;white-space:nowrap;min-width:96px;text-align:center;padding:9px 3px}.login-status{font-size:12px;color:var(--secondary);text-align:center;overflow-wrap:anywhere;padding:2px 0}.login-status.error{color:#ff453a}.login-status[hidden]{display:none}.qr-box{width:228px;height:228px;max-width:100%;margin:3px auto 5px;padding:8px;display:grid;place-items:center;background:#fff;border:1px solid var(--line);border-radius:18px;overflow:hidden}.qr-canvas{display:block;width:212px;height:212px;max-width:100%;object-fit:contain;image-rendering:pixelated}.qr-canvas.expired{filter:blur(3px);opacity:.25}.qr-placeholder{font-size:13px;color:#86868b;text-align:center}.qr-canvas[hidden],.qr-placeholder[hidden]{display:none}.qr-refresh{justify-self:center;margin-top:-4px}.captcha-overlay{position:absolute;inset:0;z-index:30;background:var(--card);display:flex;flex-direction:column;border-radius:inherit;overflow:hidden}.captcha-header{padding:19px 22px;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:16px;font-weight:600}.captcha-frame{width:100%;flex:1;min-height:0;border:0;background:white}
-      .tool-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:0}
-      .tool-action{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;min-width:0;min-height:80px;padding:10px 8px;border-radius:14px;background:var(--card);box-shadow:0 0 0 1px var(--line);text-align:center;transition:filter .16s}
+      .tool-card{position:relative;min-width:0;border-radius:14px;background:var(--card);box-shadow:0 0 0 1px var(--line)}
+      .tool-card .tool-notice[hidden]{display:none}.tool-card .tool-notice{inset:4px;transform:none;width:auto;max-width:none;display:flex;align-items:center;justify-content:center;padding:8px;font-size:12px;line-height:1.5;border:0;border-radius:11px;box-shadow:none;overflow:auto;white-space:normal}
+      .tool-action{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;height:100%;min-width:0;min-height:80px;padding:10px 8px;border-radius:14px;background:transparent;text-align:center;transition:filter .16s}
+      .pool-refresh{width:fit-content;max-width:100%;margin:0 auto}.pool-refresh .tool-action{height:auto;flex-direction:row;justify-content:center;gap:8px;min-height:44px;padding:8px 16px}.pool-refresh .tool-action .setting-label{font-size:13px}.pool-refresh .setting-icon{width:28px;height:28px}
       .tool-action:hover{filter:brightness(.97)}.tool-action .setting-label{font-size:12px;line-height:1.5;white-space:normal;overflow-wrap:anywhere}
       @media(prefers-color-scheme:dark){dialog{--text:#f5f5f7;--secondary:#9b9ba3;--card:#343438;--line:#ffffff0c;--field:#29292d;--hover:#ffffff05;--accent:#64a8ff;background:#222226f5;border-color:#ffffff19;box-shadow:0 30px 100px #0008}.close{background:#39393e}.close{color:#aaaab3}.tab{color:#a8a8af}.tab[aria-selected=true]{background:#66666c}.launcher{color:#f5f5f7;background:#303035e8;border-color:#ffffff18}.blue{background:#007aff24;color:#68adff}.green{background:#34c75920;color:#5dd280}.purple{background:#a274e923;color:#c19afb}.orange{background:#ef9b3323;color:#ffbd6b}.avatar{background:linear-gradient(145deg,#36475f,#494358);color:#c5d8f0}.badge.vip{background:#71344655;color:#efa7bd}}
-      @media(max-height:720px) and (min-width:761px){.header{padding:16px 28px 12px}.footer{padding:12px 28px 14px}.pane-heading{min-height:36px;margin-bottom:8px}.content{gap:8px;grid-template-rows:minmax(0,1fr) auto 72px}.assignment-details{grid-template-rows:54px 16px minmax(176px,1fr);gap:8px}.assignment-pane .session{padding:6px 14px}.tool-action{min-height:64px;gap:6px;padding:6px 8px}.tool-action .setting-icon{width:26px;height:26px}}
-      @media(max-width:760px){.workspace{display:block;overflow:auto;overscroll-behavior:contain}.pool-pane{max-height:260px;margin-bottom:20px;padding-right:0;padding-bottom:20px;border-right:0;border-bottom:1px solid var(--line)}.pool-pane .form{max-width:440px;margin:0 auto}.assignment-pane{height:540px}.content{min-height:0}}
-      @media(max-width:480px){dialog{border-radius:23px}.header{padding:23px 20px 19px}.workspace{padding:0 20px;gap:20px}.footer{flex:none;padding:19px 20px 22px}.account-picker{max-width:60%}.setting-row{padding:11px 12px}.setting-label,.account-picker{font-size:13px}.setting-icon{width:28px;height:28px}.session{padding:13px}.pane-heading{margin-bottom:12px}}
+      @media(max-height:720px) and (min-width:761px){.header{padding:16px 28px 12px}.footer{padding:12px 28px 14px}.pane-heading{min-height:36px;margin-bottom:8px}.content{gap:8px;grid-template-rows:minmax(0,1fr)}.assignment-details{grid-template-rows:minmax(176px,1fr);gap:8px}.tool-action{min-height:64px;gap:6px;padding:6px 8px}.tool-action .setting-icon{width:26px;height:26px}}
+      @media(max-width:760px){dialog{height:min(760px,calc(100dvh - 32px))}.workspace{display:block;overflow:auto;overscroll-behavior:contain}.pool-pane{max-height:260px;margin-bottom:20px;padding-right:0;padding-bottom:20px;border-right:0;border-bottom:1px solid var(--line)}.pool-pane.adding-account{max-height:none;overflow:visible}.pool-pane .form{max-width:440px;margin:0 auto}.assignment-pane{height:auto}.content{min-height:0;grid-template-rows:auto}.assignment-details{grid-template-rows:auto;overflow:visible}.assignments{grid-template-rows:repeat(4,minmax(80px,auto))}}
+      @media(max-width:480px){.panel-title{font-size:20px;letter-spacing:0}.panel-title .icon{width:25px;height:25px}dialog{border-radius:23px}.header{padding:23px 20px 19px}.workspace{padding:0 20px;gap:20px}.footer{flex:none;padding:19px 20px 22px}.account-picker{max-width:60%}.setting-row{padding:11px 12px}.setting-label,.account-picker{font-size:13px}.setting-icon{width:28px;height:28px}.pane-heading{margin-bottom:12px}}
       @media(prefers-reduced-motion:reduce){*,*::after{transition:none!important;animation:none!important}}
     `);
     const launcher = button('', openPanel, 'launcher');
-    launcher.setAttribute('aria-label', '账号切换'); launcher.title = '账号切换'; launcher.append(icon('person'));
-    dialog = el('dialog', null, { 'aria-label': '账号切换' });
+    launcher.setAttribute('aria-label', '哔哩哔哩账号管理'); launcher.title = '哔哩哔哩账号管理'; launcher.append(icon('bilibili'));
+    dialog = el('dialog', null, { 'aria-label': '哔哩哔哩账号管理' });
     dialog.addEventListener('click', e => {
       if (e.target !== dialog) return;
       const rect = dialog.getBoundingClientRect();
@@ -1400,24 +1425,25 @@
     shadow.append(style, launcher, dialog); document.documentElement.append(host);
   }
   function openPanel() {
-    mount(); panelDraft = { ...state.roles }; panelEnabled = state.enabled; panelAddingAccount = false;
+    mount(); panelDraft = { ...state.roles }; panelAddingAccount = false;
     render(); if (!dialog.open) dialog.showModal();
-    void refreshAccountProfiles();
+    void refreshAccountProfiles(true);
   }
   function render() {
     clearNotice();
     stopLogin();
     closeAccountMenu();
-    dialog.replaceChildren(); browserLabels = []; refreshAccountChoices = null; browserStatusBox = null;
+    dialog.replaceChildren(); browserLabels = []; refreshAccountChoices = null;
     if (!panelDraft) panelDraft = { ...state.roles };
-    if (panelEnabled === null) panelEnabled = state.enabled;
     const draft = panelDraft;
     const sheet = el('div', null, { class: 'sheet' });
     const header = el('div', null, { class: 'header' });
     const close = button('', () => dialog.close(), 'close'); close.setAttribute('aria-label', '关闭'); close.append(icon('close'));
-    header.append(el('h2', '账号切换'), close); sheet.append(header);
+    const title = el('h2', null, { class: 'panel-title' });
+    title.append(icon('bilibili'), document.createTextNode('哔哩哔哩账号管理'));
+    header.append(title, close); sheet.append(header);
     const workspace = el('div', null, { class: 'workspace' }); sheet.append(workspace);
-    const pool = el('section', null, { class: 'pool-pane', 'aria-labelledby': 'piliplus-pool-title' });
+    const pool = el('section', null, { class: `pool-pane${panelAddingAccount ? ' adding-account' : ''}`, 'aria-labelledby': 'piliplus-pool-title' });
     const management = el('section', null, { class: 'assignment-pane', 'aria-label': '账号分配管理' });
     workspace.append(pool, management);
     workspace.addEventListener('scroll', () => closeAccountMenu(), { passive: true });
@@ -1443,7 +1469,7 @@
       } catch (error) { notice(error.message || '导入失败'); }
       finally { file.value = ''; }
     });
-    const exportText = () => JSON.stringify(validateState({ ...state, roles: { ...draft }, enabled: panelEnabled }), null, 2);
+    const exportText = () => JSON.stringify(validateState({ ...state, roles: { ...draft } }), null, 2);
     const transferButton = (label, symbol, items) => {
       const trigger = button('', () => openTransferMenu(trigger, items), 'pool-transfer');
       trigger.setAttribute('aria-haspopup', 'menu'); trigger.setAttribute('aria-expanded', 'false');
@@ -1464,32 +1490,32 @@
       ['从文件导入', 'download', () => file.click()],
     ]);
     const exportButton = transferButton('导出', 'upload', [
-      ['导出到文件', 'upload', () => {
-        const url = URL.createObjectURL(new Blob([exportText()], { type: 'application/json' }));
-        el('a', null, { href: url, download: 'piliplus-web-accounts.json' }).click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000); notice('已导出到文件');
-      }],
       ['导出到剪贴板', 'upload', async () => {
         try { await page.navigator.clipboard.writeText(exportText()); }
         catch (_) { throw new Error('无法写入剪贴板，请使用导出到文件'); }
         notice('已导出到剪贴板');
       }],
+      ['导出到文件', 'upload', () => {
+        const url = URL.createObjectURL(new Blob([exportText()], { type: 'application/json' }));
+        el('a', null, { href: url, download: 'piliplus-web-accounts.json' }).click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000); notice('已导出到文件');
+      }],
     ]);
     const poolActions = el('div', null, { class: 'pool-actions' }); poolActions.append(importButton, exportButton, addAccount);
     poolHeader.append(poolTitle, poolActions, file); pool.append(poolHeader);
-    const managementHeader = el('div', null, { class: 'pane-heading' });
-    managementHeader.append(el('h3', '账号分配')); management.append(managementHeader);
     const content = el('div', null, { class: 'content', id: 'piliplus-panel-content', role: 'region', 'aria-label': '账号分配' }); management.append(content);
     const profileUpdaters = [];
     content.addEventListener('scroll', () => closeAccountMenu(), { passive: true });
-    const options = () => [{ mid: 'browser' }, { mid: '0' },
-      ...state.accounts.filter(a => a.mid !== currentBrowserMid())];
+    const options = () => [{ mid: 'browser' },
+      ...state.accounts.filter(a => a.mid !== currentBrowserMid()), { mid: '0' }];
     const makePicker = (role, title) => {
       const trigger = el('button', null, { type: 'button', class: 'account-picker', 'aria-haspopup': 'menu',
         'aria-expanded': 'false', 'aria-controls': `piliplus-account-menu-${role}` });
-      const name = el('span', null, { class: 'picker-name' }); trigger.append(name, icon('down'));
+      let picture = avatar(draft[role], 'small');
+      const name = el('span', null, { class: 'picker-name' }); trigger.append(picture, name, icon('down'));
       const selectedMid = () => currentBrowserMid() && draft[role] === currentBrowserMid() ? 'browser' : draft[role];
       profileUpdaters.push(() => {
+        const nextPicture = avatar(draft[role], 'small'); picture.replaceWith(nextPicture); picture = nextPicture;
         name.textContent = displayName(draft[role]);
         trigger.setAttribute('aria-label', `${title}：${name.textContent}`);
         trigger.title = name.textContent;
@@ -1551,11 +1577,18 @@
       return trigger;
     };
     const addTool = (card, title, symbol, color, action) => {
-      const row = button('', action, 'tool-action');
+      const frame = el('div', null, { class: 'tool-card' });
+      const feedback = el('div', null, { class: 'notice tool-notice', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true', hidden: '' });
+      const showNotice = message => notice(message, feedback);
+      const row = button('', async () => {
+        try { await action(showNotice); }
+        catch (error) { showNotice(error.message || '操作失败'); }
+      }, 'tool-action');
+      row.setAttribute('aria-label', title);
       const tile = el('span', null, { class: `setting-icon ${color}` }); tile.append(icon(symbol));
-      row.append(tile, el('span', title, { class: 'setting-label' })); card.append(row); return row;
+      row.append(tile, el('span', title, { class: 'setting-label' })); frame.append(row, feedback); card.append(frame); return row;
     };
-    const saveAndReload = () => { state.roles = { ...draft }; state.enabled = panelEnabled; save(); page.location.reload(); };
+    const saveAndReload = () => { state.roles = { ...draft }; state.enabled = true; save(); page.location.reload(); };
 
     const accounts = el('div', null, { class: 'card' });
     for (const account of panelAddingAccount ? [] : entries) {
@@ -1568,16 +1601,18 @@
         name.textContent = displayName(account.mid); name.title = name.textContent;
         const nextPicture = avatar(account.mid, 'small'); picture.replaceWith(nextPicture); picture = nextPicture;
         badges.replaceChildren();
-        if (account.mid === 'browser' || account.mid === currentBrowserMid()) badges.append(el('span', '当前登录', { class: 'badge' }));
-        if (state.accounts.find(a => a.mid === account.mid)?.vip || ((account.mid === 'browser' || account.mid === currentBrowserMid()) && browserIdentity.vip)) badges.append(el('span', '大会员', { class: 'badge vip' }));
-        if (profileAttempts.get(account.mid) === 'failed') badges.append(el('span', '登录需更新', { class: 'badge' }));
-        for (const [role, title] of Object.entries(ROLES)) {
-          const mid = draft[role];
-          if (mid === account.mid || (account.mid === 'browser' && mid === currentBrowserMid())
-            || (account.mid === currentBrowserMid() && mid === 'browser')) {
-            badges.append(el('span', title, { class: 'badge usage' }));
-          }
-        }
+        const isBrowser = account.mid === 'browser' || account.mid === currentBrowserMid();
+        const loginState = isBrowser ? browserIdentity.status : profileAttempts.get(account.mid);
+        const valid = loginState === 'loggedIn' || loginState === 'done';
+        const invalid = loginState === 'loggedOut' || loginState === 'failed' || loginState === 'error';
+        if (valid || invalid) badges.append(el('span', valid ? '有效' : '失效',
+          { class: valid ? 'badge login-valid' : 'badge login-invalid' }));
+        if (isBrowser) badges.append(el('span', '当前登录', { class: 'badge' }));
+        const savedAccount = state.accounts.find(a => a.mid === account.mid);
+        const hasProfile = isBrowser ? browserIdentity.status === 'loggedIn' : Boolean(savedAccount?.username);
+        const isVip = isBrowser ? browserIdentity.vip : savedAccount?.vip;
+        badges.append(el('span', hasProfile ? (isVip ? '大会员' : '非大会员') : '会员状态未读取',
+          { class: hasProfile && isVip ? 'badge vip' : 'badge' }));
       };
       profileUpdaters.push(update); row.append(picture, copy);
       if (account.mid !== 'browser') {
@@ -1594,59 +1629,41 @@
       }
       accounts.append(row);
     }
-    if (!panelAddingAccount) pool.append(accounts);
+    if (!panelAddingAccount) {
+      pool.append(accounts);
+      const refreshArea = el('div', null, { class: 'pool-refresh' });
+      addTool(refreshArea, '更新账号信息', 'refresh', 'purple', async showNotice => {
+        await detectBrowserAccount(); await refreshAccountProfiles(true); refreshAccountChoices?.(); showNotice('已更新');
+      });
+      pool.append(refreshArea);
+    }
     const addArea = el('div', null, { id: 'piliplus-add-account' }); addArea.hidden = !panelAddingAccount;
     pool.append(addArea);
     if (panelAddingAccount) renderLoginForm(addArea, draft);
 
     const details = el('div', null, { class: 'assignment-details' }); content.append(details);
     details.addEventListener('scroll', () => closeAccountMenu(), { passive: true });
-    const session = el('div', null, { class: 'card session' });
-    let picture = avatar('browser');
-    const copy = el('div', null, { class: 'session-copy' });
-    copy.append(el('div', '当前登录', { class: 'eyebrow' }));
-    browserStatusBox = el('div', browserLabel(), { class: 'session-name' }); copy.append(browserStatusBox);
-    const enabled = button('', () => {
-      panelEnabled = !panelEnabled; enabled.setAttribute('aria-checked', String(panelEnabled));
-    }, 'switch');
-    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用多账号'); enabled.setAttribute('aria-checked', String(panelEnabled));
-    session.append(picture, copy, enabled); details.append(session);
-    profileUpdaters.push(() => { const nextPicture = avatar('browser'); picture.replaceWith(nextPicture); picture = nextPicture; });
-    details.append(el('h3', '用途分配'));
     const assignments = el('div', null, { class: 'card assignments' });
     const symbols = { main: ['person', 'blue'], heartbeat: ['history', 'green'], recommend: ['sparkle', 'purple'], video: ['play', 'orange'] };
+    const descriptions = {
+      main: '点赞、投币、收藏、关注、发评论等',
+      heartbeat: '将观看历史记录到此账号',
+      recommend: '根据此账号获取推荐内容',
+      video: '使用此账号的权限获取视频流',
+    };
     for (const [role, title] of Object.entries(ROLES)) {
       const row = el('div', null, { class: 'setting-row' });
       const tile = el('span', null, { class: `setting-icon ${symbols[role][1]}` }); tile.append(icon(symbols[role][0]));
-      row.append(tile, el('span', title, { class: 'setting-label' }), makePicker(role, title)); assignments.append(row);
+      const copy = el('div', null, { class: 'setting-copy' });
+      const description = el('span', descriptions[role], { class: 'setting-description', id: `piliplus-role-description-${role}` });
+      copy.append(el('span', title, { class: 'setting-label' }), description);
+      const picker = makePicker(role, title); picker.setAttribute('aria-describedby', description.id);
+      row.append(tile, copy, picker); assignments.append(row);
     }
     details.append(assignments);
-    const tools = el('div', null, { class: 'tool-actions', role: 'group', 'aria-label': '账号工具' });
-    addTool(tools, '验证取流账号', 'shield', 'green', async () => {
-      if (draft.video === '0') { notice('当前使用匿名取流'); return; }
-      const account = state.accounts.find(a => a.mid === draft.video);
-      let data;
-      if (draft.video === 'browser') {
-        const identity = await detectBrowserAccount();
-        if (identity.status !== 'loggedIn') throw new Error('当前未登录');
-        data = { uname: identity.name, vipStatus: identity.vip ? 1 : 0 };
-      } else {
-        if (!account) throw new Error('请选择取流账号');
-        data = await verify(account); saveProfile(account.mid, data); save(); refreshAccountChoices?.();
-      }
-      notice(`${data.uname || displayName(draft.video)} · ${Number(data.vipStatus ?? data.vip?.status) === 1 ? '大会员有效' : '登录有效'}`);
-    });
-    addTool(tools, '同步播放器账号', 'play', 'blue', async () => {
-      if (draft.video !== state.roles.video || panelEnabled !== state.enabled) throw new Error('请先保存设置');
-      notice('正在同步…'); const mid = await refreshPlayerAccess(); notice(`${displayName(String(mid || '0'))} · 已同步`);
-    });
-    addTool(tools, '更新账号信息', 'refresh', 'purple', async () => {
-      await detectBrowserAccount(); await refreshAccountProfiles(true); refreshAccountChoices?.(); notice('已更新');
-    });
-    content.append(tools);
     const noticeSlot = el('div', null, { class: 'notice-slot' });
     statusBox = el('div', null, { class: 'notice', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true', hidden: '' }); noticeSlot.append(statusBox);
-    content.append(noticeSlot);
+    sheet.append(noticeSlot);
     const footer = el('div', null, { class: 'footer' }); footer.append(button('取消', () => dialog.close(), 'action'), button('保存并刷新', saveAndReload, 'action primary')); sheet.append(footer);
     dialog.append(sheet);
     refreshAccountChoices = () => {
@@ -4116,8 +4133,7 @@ var qrcode = function() {
   if (page.self === page.top) {
     // Start reading the real browser account before presenting account choices.
     void detectBrowserAccount();
-    GM_registerMenuCommand('PiliPlus：账号切换', openPanel);
-    GM_registerMenuCommand('PiliPlus：紧急停用并刷新', () => { state.enabled = false; save(); page.location.reload(); });
+    GM_registerMenuCommand('哔哩哔哩账号管理', openPanel);
     if (document.documentElement) mount();
     else new MutationObserver((_records, observer) => {
       if (document.documentElement) { observer.disconnect(); mount(); }

@@ -66,6 +66,20 @@ for (const options of [{}, { mid: '0' }, { enabled: false }, { mid: 'browser' },
   });
 }
 
+test('legacy disabled settings still route requests and discard browser stream preload', async () => {
+  const { page, nano, hooks, requests } = setup({ enabled: false });
+  const route = hooks.target('https://api.bilibili.com/x/player/wbi/playurl?aid=1&cid=7');
+  assert.equal(route.mid, '123');
+  await hooks.transport(route).promise;
+  assert.ok(requests[0].cookie.includes('DedeUserID=123'));
+  page.nano.createPlayer({ prefetch: { playUrl: { account: 'browser' } } });
+  assert.equal(nano.lastConfig.prefetch.playUrl, undefined);
+  page.__playinfo__ = { account: 'browser' };
+  assert.equal(page.__playinfo__, undefined);
+  await hooks.refreshPlayerAccess(page.player = page.nano.createPlayer({}));
+  assert.equal(page.player.reloads, 1);
+});
+
 test('separate video account discards browser stream preload and preserves other config', () => {
   const { page, nano } = setup();
   const config = { prefetch: { playUrl: { account: 'browser' }, view: { aid: 1 } }, autoplay: true };
