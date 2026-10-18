@@ -92,11 +92,16 @@ test('real project README can be published without altering the maintained docum
   const { renderReadme } = await renderer;
   const filename = path.resolve(__dirname, '../README.md');
   const source = fs.readFileSync(filename, 'utf8');
-  const output = renderReadme(source, options);
+  const images = [];
+  const output = renderReadme(source, {
+    ...options,
+    onLocalImage: (image) => images.push(image),
+  });
   assert.match(output, /^# Bilibili Multi-Account/);
-  assert.ok(
-    output.includes('![账号管理界面](docs/images/panel.png)'),
-    'Markdown example stays local',
-  );
+  assert.ok(images.length > 0, 'Project README includes screenshots');
+  for (const image of images) {
+    assert.ok(fs.statSync(path.resolve(__dirname, '..', image)).isFile());
+    assert.ok(output.includes(`https://raw.githubusercontent.com/owner/project/abc123/${image}`));
+  }
   assert.equal(fs.readFileSync(filename, 'utf8'), source);
 });

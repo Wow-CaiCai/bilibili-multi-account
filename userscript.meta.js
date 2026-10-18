@@ -3,6 +3,8 @@
 // @namespace    bilibili.local.multi-account
 // @version      1.0
 // @description  支持密码、短信、二维码登录，按主账号、记录观看、推荐和视频取流分别选择 B 站账号。
+// @author       Wow-CaiCai (https://github.com/Wow-CaiCai)
+// @icon         https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/users-round.svg
 // @match        https://*.bilibili.com/*
 // @match        https://bilibili.com/*
 // @exclude      https://passport.bilibili.com/*
